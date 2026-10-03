@@ -52,6 +52,27 @@ public class ForgeInterface
         }
     }
 
+    /**
+     * Drops the cached {@link net.minecraft.world.World} config when a dimension goes away.
+     * <p>
+     * {@link ServerState} keys its config cache by {@code World}, and the cached
+     * {@link CustomOreGen.Server.WorldConfig} holds a strong reference back to that same
+     * {@code World}. Without this handler every dimension ever loaded stays reachable for the
+     * lifetime of the JVM, which is what Forge's world leak detector reports.
+     */
+    @SubscribeEvent
+    public void onUnloadWorld(WorldEvent.Unload event)
+    {
+        if (event.world instanceof WorldServer)
+        {
+            ServerState.clearWorldConfig(event.world);
+        }
+        else if (event.world instanceof WorldClient)
+        {
+            ClientState.onWorldChanged(null);
+        }
+    }
+
     @SubscribeEvent
     public void onLoadChunk(ChunkEvent.Load event)
     {

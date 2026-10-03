@@ -1,6 +1,7 @@
 package CustomOreGen.Server;
 
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import net.minecraft.util.MathHelper;
 import net.minecraft.world.World;
@@ -520,6 +521,17 @@ public class MapGenVeins extends MapGenOreDistribution
         
         class interpolationContext
         {
+            /**
+             * Hard ceiling on adaptive sub-steps taken for a single tube segment.  A well behaved
+             * segment needs a handful; anything approaching this many means the error estimate can
+             * never be satisfied and the loop below would otherwise spin for as long as the world
+             * keeps generating chunks.
+             */
+            private static final int MAX_STEPS = 4096;
+
+            /** Number of degenerate segments reported so far, used only to rate limit logging. */
+            private static final AtomicInteger degenerateReports = new AtomicInteger();
+
             public float[] pos;
             public float[] der;
             public float derLen;
@@ -528,7 +540,10 @@ public class MapGenVeins extends MapGenOreDistribution
             public float t;
             public float dt;
             public boolean calcDer;
-    
+
+            /** True once this segment has been found to have no usable geometry; see {@link #degenerate()}. */
+            private boolean collapsed;
+
             public interpolationContext()
             {
                 this.pos = new float[3];
@@ -540,6 +555,7 @@ public class MapGenVeins extends MapGenOreDistribution
             public void init(float stepSize, boolean calculateDirection)
             {
                 this.t = prev != null && prev.next != BezierTubeComponent.this ? -1.0F : -0.5F;
+                this.collapsed = false;
 
                 if (stepSize > 0.0F)
                 {
@@ -549,26 +565,66 @@ public class MapGenVeins extends MapGenOreDistribution
                 interpolatePosition(this.pos, this.t);
                 this.radius = interpolateRadius(this.t);
                 this.calcDer = calculateDirection;
+                this.err = 0.0F;
+
+                if (!Float.isFinite(this.pos[0]) || !Float.isFinite(this.pos[1]) || !Float.isFinite(this.pos[2])
+                        || !Float.isFinite(this.radius))
+                {
+                    degenerate();
+                    return;
+                }
 
                 if (this.calcDer)
                 {
                     interpolateDerivative(this.der, this.t);
                     this.derLen = MathHelper.sqrt_float(this.der[0] * this.der[0] + this.der[1] * this.der[1] + this.der[2] * this.der[2]);
-                    this.der[0] /= this.derLen;
-                    this.der[1] /= this.derLen;
-                    this.der[2] /= this.derLen;
+
+                    // Normalising by a zero-length or non-finite derivative yields NaN.  Every
+                    // comparison advance() makes against NaN is false, which pushes it down the
+                    // "grow dt" branch forever, so a degenerate segment must be flagged up front.
+                    if (Float.isFinite(this.derLen) && this.derLen > 0.0F)
+                    {
+                        this.der[0] /= this.derLen;
+                        this.der[1] /= this.derLen;
+                        this.der[2] /= this.derLen;
+                    }
+                    else
+                    {
+                        degenerate();
+                    }
                 }
                 else
                 {
                     this.derLen = 0.0F;
                     this.der[0] = this.der[1] = this.der[2] = 0.0F;
                 }
+            }
 
-                this.err = 0.0F;
+            /**
+             * Marks this segment as degenerate: it collapses to a point, so there is nothing left
+             * to emit and no direction to walk.  {@link #advance} then terminates on its first call.
+             */
+            private void degenerate()
+            {
+                this.derLen = 0.0F;
+                this.der[0] = this.der[1] = this.der[2] = 0.0F;
+                this.radius = 0.0F;
+                this.collapsed = true;
+
+                if (degenerateReports.incrementAndGet() <= 10)
+                {
+                    CustomOreGenBase.log.warn("CustomOreGen: skipping degenerate bezier tube segment, "
+                            + "zero length or non-finite derivative.  " + this);
+                }
             }
 
             public boolean advance(float tolerance)
             {
+                if (this.collapsed)
+                {
+                    return false;
+                }
+
                 final float pX = this.pos[0];
                 final float pY = this.pos[1];
                 final float pZ = this.pos[2];
@@ -578,8 +634,18 @@ public class MapGenVeins extends MapGenOreDistribution
                 final float r = this.radius;
 
                 int countDeadlock = 10;
+                int steps = 0;
                 do
                 {
+                    // A non-finite t or dt means the adaptive step size has already overflowed to
+                    // infinity, so no amount of further iteration can make progress.  Bail out
+                    // before touching the interpolators, which would just keep producing NaN.
+                    if (++steps > MAX_STEPS || !Float.isFinite(this.t) || !Float.isFinite(this.dt))
+                    {
+                        degenerate();
+                        return false;
+                    }
+
                     final float nt = this.t + this.dt;
                     interpolatePosition(this.pos, nt);
                     final float deltaX = pX - this.pos[0];
@@ -599,13 +665,19 @@ public class MapGenVeins extends MapGenOreDistribution
                     {
                         interpolateDerivative(this.der, nt);
                         this.derLen = MathHelper.sqrt_float(this.der[0] * this.der[0] + this.der[1] * this.der[1] + this.der[2] * this.der[2]);
-                        if (derLen > 0.0F) {
+
+                        if (Float.isFinite(this.derLen) && this.derLen > 0.0F)
+                        {
                             this.der[0] /= this.derLen;
                             this.der[1] /= this.derLen;
                             this.der[2] /= this.derLen;
-                        } else {
-                            radius = 0.0F;
                         }
+                        else
+                        {
+                            degenerate();
+                            return false;
+                        }
+
                         der_deltaX = -dZ * this.der[1] + dY * this.der[2];
                         der_deltaY = dZ * this.der[0] - dX * this.der[2];
                         der_deltaZ = -dY * this.der[0] + dX * this.der[1];
@@ -613,13 +685,22 @@ public class MapGenVeins extends MapGenOreDistribution
                         this.err += avg2R * avg2R * derErr;
                     }
 
+                    // A NaN error satisfies neither ">" nor ">=" below, so the loop would always take
+                    // the grow-dt branch and march dt towards infinity without ever advancing t.
+                    // Infinity is still >= ulp(t) * 2, so the trailing guard cannot break out either.
+                    if (!Float.isFinite(this.err) || !Float.isFinite(this.radius))
+                    {
+                        degenerate();
+                        return false;
+                    }
+
                     final float maxErr = tolerance * tolerance;
 
-                    if (this.err > maxErr && radius != 0.0F)
+                    if (this.err > maxErr && this.radius != 0.0F)
                     {
                         this.dt = (float)((double)this.dt * 0.6D);
                     }
-                    else if (this.err >= maxErr / 5.0F || radius == 0.0F)
+                    else if (this.err >= maxErr / 5.0F || this.radius == 0.0F)
                     {
                         this.t += this.dt;
                         return this.t < 0.5F;
@@ -628,13 +709,14 @@ public class MapGenVeins extends MapGenOreDistribution
                     {
                         this.dt = (float)((double)this.dt * 1.8D);
                     }
-                    countDeadlock--;
-                    if (countDeadlock == 0) {
+
+                    // Reported at most once per segment: this used to log on every remaining
+                    // iteration, which turned a stuck segment into an unbounded log write storm.
+                    if (++countDeadlock == 0)
+                    {
                         CustomOreGenBase.log.info(String.format("Deadlock at pos (%f %f %f) der (%f %f %f) radius %f with tolerance %f",
                                                                 pX, pY, pZ, dX, dY, dZ, r,
                                                                 tolerance));
-                    }
-                    if (countDeadlock <= 0) {
                         CustomOreGenBase.log.info(String.format("Deadlock count is %d, in %s, maxErr %f, nt %f, delta(%f %f %f), d2 %f, der_delta(%f %f %f), derErr %f",
                                                                 countDeadlock, this,
                                                                 maxErr,
@@ -645,6 +727,8 @@ public class MapGenVeins extends MapGenOreDistribution
                 }
                 while (this.dt >= Math.ulp(this.t) * 2.0F);
 
+                // dt has been halved repeatedly without the error ever dropping below the
+                // tolerance, so this segment cannot be resolved at float precision.
                 throw new RuntimeException("CustomOreGen: Detected a possible infinite loop during bezier interpolation.  Please report this error.");
             }
     
