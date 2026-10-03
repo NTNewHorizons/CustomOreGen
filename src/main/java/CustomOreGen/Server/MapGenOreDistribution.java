@@ -1,8 +1,6 @@
 package CustomOreGen.Server;
 
-import java.util.Collection;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Random;
 
@@ -566,10 +564,11 @@ public abstract class MapGenOreDistribution extends MapGenStructure implements I
             ChunkPosition minPos = null;
             int minDist2 = Integer.MAX_VALUE;
             StructureBoundingBox searchBounds = new StructureBoundingBox(Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE);
-            for (StructureGroup vs : (Collection<StructureGroup>)super.structureMap.values()) {
-            	if (vs.getBoundingBox().intersectsWith(searchBounds))
+            for (StructureStart vs : super.structureMap.values()) {
+            	if (((StructureGroup)vs).getBoundingBox().intersectsWith(searchBounds))
                 {
-                	for (Component vc : (List<Component>)vs.getComponents()) {
+                	for (StructureComponent sc : vs.getComponents()) {
+                		Component vc = (Component)sc;
                 		if (vc.getComponentType() == 0)
                         {
                             ChunkPosition center = vc.func_151553_a();
@@ -728,7 +727,8 @@ public abstract class MapGenOreDistribution extends MapGenStructure implements I
         {
             GeometryStream builder;
 
-            for (Component comp : (List<Component>)this.getComponents()) {
+            for (StructureComponent sc : this.getComponents()) {
+            	Component comp = (Component)sc;
             	StructureBoundingBox bb = comp.getBoundingBox();
                 int cX = bb.getCenterX() / 16;
                 int cZ = bb.getCenterZ() / 16;
